@@ -37,6 +37,7 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    float norm_eps; // mellum-rdna3 fork: NORM_FUSION only (zero otherwise)
 #endif
 } p;
 

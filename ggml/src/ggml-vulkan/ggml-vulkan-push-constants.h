@@ -29,6 +29,7 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
+    float norm_eps; // NORM_FUSION mat-vec only
 };
 
 struct vk_mat_vec_p021_push_constants {

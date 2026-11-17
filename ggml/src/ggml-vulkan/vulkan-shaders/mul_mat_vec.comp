@@ -16,7 +16,72 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 uint a_offset, b_offset, d_offset, y_offset;
 
+#ifdef NORM_FUSION
+// B is the raw RMS_NORM input: one contiguous row, ncols % 4 == 0. Each workgroup computes the norm scale itself.
+#if !USE_SUBGROUP_ADD_NO_SHMEM
+shared float norm_sh[BLOCK_SIZE];
+#endif
+float norm_s;
+
+void norm_prologue() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint ncols4 = p.ncols / 4;
+    float sum = 0.0;
+    for (uint c = tid; c < ncols4; c += BLOCK_SIZE) {
+        const vec4 x = vec4(data_b_v4[c]);
+        sum += dot(x, x);
+    }
+#if USE_SUBGROUP_ADD_NO_SHMEM
+    sum = subgroupAdd(sum);
+#elif USE_SUBGROUP_ADD
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        norm_sh[gl_SubgroupID] = sum;
+    }
+    barrier();
+    sum = 0.0;
+    for (uint s = 0; s < gl_NumSubgroups; ++s) {
+        sum += norm_sh[s];
+    }
+#else
+    norm_sh[tid] = sum;
+    barrier();
+    for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            norm_sh[tid] += norm_sh[tid + s];
+        }
+        barrier();
+    }
+    sum = norm_sh[0];
+#endif
+    norm_s = inversesqrt(sum / float(p.ncols) + p.norm_eps);
+
+    // each workgroup writes one slice of the normalized row
+    const uint n_wg = gl_NumWorkGroups.x * gl_NumWorkGroups.z;
+    const uint wg = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+    const uint per_wg = (ncols4 + n_wg - 1) / n_wg;
+    const uint c_end = min(ncols4, (wg + 1) * per_wg);
+    for (uint c = wg * per_wg + tid; c < c_end; c += BLOCK_SIZE) {
+        data_norm_out_v4[c] = (norm_s * vec4(data_b_v4[c])) * data_norm_w_v4[c];
+    }
+}
+#endif
+
+vec4 load_b_raw(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w);
+
 vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
+    vec4 b = load_b_raw(j, iybs, iqs, lastiter, OOB_y, OOB_z, OOB_w);
+#ifdef NORM_FUSION
+    const uint c = iybs + iqs;
+    b.x = (norm_s * b.x) * float(data_fuse0[c]);
+    if (!OOB_y) { b.y = (norm_s * b.y) * float(data_fuse0[c + y_offset]); }
+    if (!OOB_z) { b.z = (norm_s * b.z) * float(data_fuse0[c + y_offset*2]); }
+    if (!OOB_w) { b.w = (norm_s * b.w) * float(data_fuse0[c + y_offset*3]); }
+#endif
+    return b;
+}
+
+vec4 load_b_raw(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
     // Check if the latter elements are OOB, and don't fetch B or accumulate it.
     OOB_y = lastiter && (iybs + iqs + y_offset >= p.ncols);
     OOB_z = lastiter && (iybs + iqs + y_offset*2 >= p.ncols);
@@ -122,7 +187,11 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
         const uint iqs = 0; // quant index
         const uint iybs = col; // y block start index
 
+#ifdef NORM_FUSION
+        const vec4 b = (norm_s * vec4(data_b_v4[(iybs + iqs) / 4])) * data_norm_w_v4[(iybs + iqs) / 4];
+#else
         const vec4 b = data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4];
+#endif
 
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -250,6 +319,10 @@ void main() {
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
+#endif
+
+#ifdef NORM_FUSION
+    norm_prologue();
 #endif
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
