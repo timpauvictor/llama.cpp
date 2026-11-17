@@ -1877,6 +1877,32 @@ static bool ggml_vk_amd_large_tile_supported(const vk_device& device) {
     return major > 2 || (major == 2 && build >= 416);
 }
 
+// mellum-rdna3 fork: benchmark-only launch tuning overrides for the mat-vec kernels.
+//   LLAMA_MELLUM_RM_KQ / _RM_STDQ / _RM_IQ / _RM_KQ_INT / _RM_STDQ_INT = rows per workgroup (read at shader load)
+//   LLAMA_MELLUM_DMMV_WG = subgroup | large: workgroup size (one subgroup, or 4 subgroups)
+static uint32_t ggml_vk_env_u32(const char * name, uint32_t def) {
+    const char * v = getenv(name);
+    if (v == nullptr || atoi(v) <= 0) {
+        return def;
+    }
+    GGML_LOG_INFO("ggml_vulkan: %s=%d (default %u)\n", name, atoi(v), def);
+    return (uint32_t) atoi(v);
+}
+
+static uint32_t ggml_vk_dmmv_wg_override(uint32_t dmmv_wg) {
+    static const int forced = [] {
+        const char * v = getenv("LLAMA_MELLUM_DMMV_WG");
+        if (v == nullptr) {
+            return -1;
+        }
+        const std::string s = v;
+        const int w = s == "large" ? (int) DMMV_WG_SIZE_LARGE : s == "subgroup" ? (int) DMMV_WG_SIZE_SUBGROUP : -1;
+        GGML_LOG_INFO("ggml_vulkan: LLAMA_MELLUM_DMMV_WG=%s\n", v);
+        return w;
+    }();
+    return forced < 0 ? dmmv_wg : (uint32_t) forced;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -3093,9 +3119,14 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) {
             return 4u;
         }
-        return is_rdna3_or_4 ? 4u : rows;
+        return ggml_vk_env_u32("LLAMA_MELLUM_RM_ID", is_rdna3_or_4 ? 4u : rows); // fork: benchmark override
     };
-    uint32_t rm_iq = 2 * rm_kq;
+    // mellum-rdna3 fork: launch tuning overrides for benchmarks (rows per workgroup)
+    rm_stdq     = ggml_vk_env_u32("LLAMA_MELLUM_RM_STDQ", rm_stdq);
+    rm_kq       = ggml_vk_env_u32("LLAMA_MELLUM_RM_KQ", rm_kq);
+    rm_stdq_int = ggml_vk_env_u32("LLAMA_MELLUM_RM_STDQ_INT", rm_stdq_int);
+    rm_kq_int   = ggml_vk_env_u32("LLAMA_MELLUM_RM_KQ_INT", rm_kq_int);
+    uint32_t rm_iq = ggml_vk_env_u32("LLAMA_MELLUM_RM_IQ", 2 * rm_kq);
 
     const bool use_subgroups = device->subgroup_arithmetic;
     // The Imagination proprietary compiler rejects the subgroup-only dequant mul_mat_vec
@@ -5922,6 +5953,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         }
     }
 
+    dmmv_wg = ggml_vk_dmmv_wg_override(dmmv_wg);
+
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
@@ -6009,6 +6042,8 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
             }
         }
     }
+
+    dmmv_wg = ggml_vk_dmmv_wg_override(dmmv_wg);
 
     if (b_type == GGML_TYPE_Q8_1) {
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
@@ -11421,6 +11456,7 @@ static void ggml_vk_moe_down(ggml_backend_vk_context * ctx, vk_context& subctx, 
             nrows <= 8192 && ncols * n_used >= 1024) {
         dmmv_wg = DMMV_WG_SIZE_LARGE;
     }
+    dmmv_wg = ggml_vk_dmmv_wg_override(dmmv_wg);
     vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_moe[dmmv_wg][a->type];
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
@@ -13007,6 +13043,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // closed explicitly below, and by the destructor on the early returns
     ggml_vk_debug_label dbg(compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops);
 
+    for (int rep = 0; rep < (ctx->dup_node ? 2 : 1); ++rep) {
+    if (rep > 0) {
+        ggml_vk_sync_buffers(ctx, compute_ctx); // cache-hot timing test: rerun after the first run completes
+    }
     if (ctx->ablate_node) {
         // timing ablation: barrier check done above, no dispatch
     } else
@@ -13423,6 +13463,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
     default:
         return false;
+    }
     }
 
     // the submit path below can end the command buffer, so close the region first
@@ -14288,31 +14329,35 @@ static int ggml_vk_norm_mul_mat_vec_end(const ggml_backend_vk_context * ctx, con
     return end;
 }
 
-// Timing-only ablation (mellum-rdna3 fork): LLAMA_MELLUM_ABLATE=tok,tok skips the dispatch of every node group whose
-// label (fusion name, else op name) equals a token, or that contains a node named "<tok>-<layer>". The barrier check
-// still runs, but the group marks nothing as written. Output is garbage; use only to bound fusion gains.
-static bool ggml_vk_ablate(const struct ggml_cgraph * cgraph, int node_idx, int num_fused, const char * fusion_string) {
-    static const std::vector<std::string> tokens = [] {
-        std::vector<std::string> t;
-        const char * v = getenv("LLAMA_MELLUM_ABLATE");
-        std::string s = v ? v : "";
-        size_t pos = 0;
-        while (pos <= s.size() && !s.empty()) {
-            const size_t end = s.find(',', pos);
-            const std::string tok = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-            if (!tok.empty()) {
-                t.push_back(tok);
-            }
-            if (end == std::string::npos) {
-                break;
-            }
-            pos = end + 1;
+// Timing-only switches (mellum-rdna3 fork). A token matches a node group whose label (fusion name, else op name)
+// equals it, or that contains a node named "<tok>-<layer>". Outputs become garbage; benchmarks only.
+//   LLAMA_MELLUM_ABLATE=tok,...: the group dispatches nothing; the barrier check still runs, but nothing is marked
+//     written. Bounds what a fusion could save.
+//   LLAMA_MELLUM_DUP=tok,...: the group is dispatched twice with a barrier between; the second run finds its weights
+//     in the cache. Bounds what prefetching weights into the cache could save.
+static std::vector<std::string> ggml_vk_env_tokens(const char * env, const char * what) {
+    std::vector<std::string> t;
+    const char * v = getenv(env);
+    std::string s = v ? v : "";
+    size_t pos = 0;
+    while (!s.empty()) {
+        const size_t end = s.find(',', pos);
+        const std::string tok = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        if (!tok.empty()) {
+            t.push_back(tok);
         }
-        if (!t.empty()) {
-            GGML_LOG_WARN("ggml_vulkan: LLAMA_MELLUM_ABLATE=%s: timing ablation, output is garbage\n", s.c_str());
+        if (end == std::string::npos) {
+            break;
         }
-        return t;
-    }();
+        pos = end + 1;
+    }
+    if (!t.empty()) {
+        GGML_LOG_WARN("ggml_vulkan: %s=%s: %s, output is garbage\n", env, s.c_str(), what);
+    }
+    return t;
+}
+
+static bool ggml_vk_tokens_match(const std::vector<std::string> & tokens, const struct ggml_cgraph * cgraph, int node_idx, int num_fused, const char * fusion_string) {
     if (tokens.empty()) {
         return false;
     }
@@ -14329,6 +14374,16 @@ static bool ggml_vk_ablate(const struct ggml_cgraph * cgraph, int node_idx, int 
         }
     }
     return false;
+}
+
+static bool ggml_vk_ablate(const struct ggml_cgraph * cgraph, int node_idx, int num_fused, const char * fusion_string) {
+    static const std::vector<std::string> tokens = ggml_vk_env_tokens("LLAMA_MELLUM_ABLATE", "timing ablation");
+    return ggml_vk_tokens_match(tokens, cgraph, node_idx, num_fused, fusion_string);
+}
+
+static bool ggml_vk_dup(const struct ggml_cgraph * cgraph, int node_idx, int num_fused, const char * fusion_string) {
+    static const std::vector<std::string> tokens = ggml_vk_env_tokens("LLAMA_MELLUM_DUP", "cache-hot timing test");
+    return ggml_vk_tokens_match(tokens, cgraph, node_idx, num_fused, fusion_string);
 }
 
 // One-token MoE down-projection group: MUL_MAT_ID (IQ4_NL / Q5_0 experts, [ncols x n_used] input), MUL by the router
@@ -15654,6 +15709,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         ctx->ablate_node = ggml_vk_ablate(cgraph, i, ctx->num_additional_fused_ops, fusion_string);
+        ctx->dup_node = !ctx->ablate_node && ggml_vk_dup(cgraph, i, ctx->num_additional_fused_ops, fusion_string);
         if (ctx->ablate_node) {
             ctx->fused_ops_write_mask = 0; // later users see no pending write, as with a fused producer
         }
@@ -15716,6 +15772,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // End the command buffer and submit/wait
         GGML_ASSERT(!ctx->compute_ctx.expired());
         compute_ctx = ctx->compute_ctx.lock();
+        if (vk_perf_logger_concurrent) {
+            // close the last group (after the final barrier), so the per-graph total covers every dispatch
+            ctx->query_node_idx[ctx->query_idx] = cgraph->n_nodes;
+            compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         ggml_vk_submit(compute_ctx, ctx->device->fence);

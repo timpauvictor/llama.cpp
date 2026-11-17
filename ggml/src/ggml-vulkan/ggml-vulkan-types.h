@@ -1349,6 +1349,8 @@ struct ggml_backend_vk_context {
     bool fused_moe_down {};
     // LLAMA_MELLUM_ABLATE timing ablation: this node group dispatches nothing (output is garbage)
     bool ablate_node {};
+    // LLAMA_MELLUM_DUP timing test: this node group is dispatched twice, with a barrier between (output may be garbage)
+    bool dup_node {};
     struct deferred_norm {
         const ggml_tensor * mul;
         const ggml_tensor * x;
