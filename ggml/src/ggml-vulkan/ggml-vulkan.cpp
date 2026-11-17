@@ -3113,6 +3113,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     static constexpr uint32_t mul_mat_vec_num_bindings = 5;
     static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
     static constexpr uint32_t mul_mat_vec_norm_num_bindings = 6; // + RMS partials
+    static constexpr uint32_t mul_mat_vec_moe_num_bindings = 7;  // + expert ids, router weights
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
 #define OCP_DMMV_LEN(NAME, REDUC)  (device->ocp_fp4 ? NAME ## _ocp_len[REDUC]  : NAME ## _len[REDUC])
@@ -3159,6 +3160,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             if (i == 0) {
                 ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_norm_q[w][GGML_TYPE_Q4_K], "mul_mat_vec_norm_q4_k_f32_f32", arr_dmmv_norm_q4_k_f32_f32_len[reduc16], arr_dmmv_norm_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_norm_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, 1}, 1, true, use_subgroups16, force_subgroup_size16);
                 ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_norm_q[w][GGML_TYPE_Q5_K], "mul_mat_vec_norm_q5_k_f32_f32", arr_dmmv_norm_q5_k_f32_f32_len[reduc16], arr_dmmv_norm_q5_k_f32_f32_data[reduc16], "main", mul_mat_vec_norm_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, 1}, 1, true, use_subgroups16, force_subgroup_size16);
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_moe[w][GGML_TYPE_Q5_0], "mul_mat_vec_moe_q5_0_f32_f32", arr_dmmv_moe_q5_0_f32_f32_len[reduc], arr_dmmv_moe_q5_0_f32_f32_data[reduc], "main", mul_mat_vec_moe_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, 1}, 1, true, use_subgroups, force_subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_moe[w][GGML_TYPE_IQ4_NL], "mul_mat_vec_moe_iq4_nl_f32_f32", arr_dmmv_moe_iq4_nl_f32_f32_len[reduc16], arr_dmmv_moe_iq4_nl_f32_f32_data[reduc16], "main", mul_mat_vec_moe_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, 1}, 1, true, use_subgroups16, force_subgroup_size16);
                 ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_norm_q[w][GGML_TYPE_Q6_K], "mul_mat_vec_norm_q6_k_f32_f32", arr_dmmv_norm_q6_k_f32_f32_len[reduc16], arr_dmmv_norm_q6_k_f32_f32_data[reduc16], "main", mul_mat_vec_norm_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, 1}, 1, true, use_subgroups16, force_subgroup_size16);
             }
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ1_0][i], "mul_mat_vec_tq1_0_f32_f32", arr_dmmv_tq1_0_f32_f32_len[reduc16], arr_dmmv_tq1_0_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -11396,6 +11399,47 @@ static void ggml_vk_mul_mat_vec_deferred_norm(ggml_backend_vk_context * ctx, vk_
         pc, { groups_x, 1, groups_z });
 }
 
+static int ggml_vk_moe_down_end(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** residual);
+
+static void ggml_vk_moe_down(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * mm  = cgraph->nodes[node_idx];
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * out = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+    const ggml_tensor * res = nullptr;
+    GGML_ASSERT(ggml_vk_moe_down_end(ctx, cgraph, node_idx, &res) == node_idx + ctx->num_additional_fused_ops);
+    const ggml_tensor * a   = mm->src[0];
+    const ggml_tensor * b   = mm->src[1];
+    const ggml_tensor * ids = mm->src[2];
+    const ggml_tensor * wts = mul->src[1];
+
+    const uint32_t ncols  = (uint32_t)a->ne[0];
+    const uint32_t nrows  = (uint32_t)a->ne[1];
+    const uint32_t n_used = (uint32_t)ids->ne[0];
+
+    uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+    if (((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) &&
+            nrows <= 8192 && ncols * n_used >= 1024) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
+    }
+    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_moe[dmmv_wg][a->type];
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const uint32_t expert_stride = (uint32_t)(a->nb[2] / ggml_type_size(a->type) * ggml_blck_size(a->type));
+    const vk_mat_vec_push_constants pc = {
+        ncols, ncols, ncols, nrows,
+        expert_stride, ncols * n_used, nrows,
+        MAT_VEC_FUSION_FLAGS_BIAS0,
+        0, 1, 1, 1, 1,
+        0.0f, 0, 0,
+        n_used,
+    };
+    vk_subbuffer d_res = ggml_vk_tensor_subbuffer(ctx, res);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, a), ggml_vk_tensor_subbuffer(ctx, b), ggml_vk_tensor_subbuffer(ctx, out),
+          d_res, d_res, ggml_vk_tensor_subbuffer(ctx, ids), ggml_vk_tensor_subbuffer(ctx, wts) },
+        pc, { nrows, 1, 1 });
+}
+
 void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, float * op_params) {
     ggml_tensor * rms = cgraph->nodes[node_idx];
     const ggml_tensor * src0 = rms->src[0];
@@ -12963,6 +13007,9 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
     // closed explicitly below, and by the destructor on the early returns
     ggml_vk_debug_label dbg(compute_ctx, cgraph, node_idx, ctx->num_additional_fused_ops);
 
+    if (ctx->ablate_node) {
+        // timing ablation: barrier check done above, no dispatch
+    } else
     switch (node->op) {
     case GGML_OP_REPEAT:
         ggml_vk_repeat(ctx, compute_ctx, src0, node);
@@ -13317,7 +13364,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
         break;
     case GGML_OP_MUL_MAT_ID:
-        ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
+        if (ctx->fused_moe_down) {
+            ggml_vk_moe_down(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
+        }
 
         break;
 
@@ -14235,6 +14286,140 @@ static int ggml_vk_norm_mul_mat_vec_end(const ggml_backend_vk_context * ctx, con
         return -1;
     }
     return end;
+}
+
+// Timing-only ablation (mellum-rdna3 fork): LLAMA_MELLUM_ABLATE=tok,tok skips the dispatch of every node group whose
+// label (fusion name, else op name) equals a token, or that contains a node named "<tok>-<layer>". The barrier check
+// still runs, but the group marks nothing as written. Output is garbage; use only to bound fusion gains.
+static bool ggml_vk_ablate(const struct ggml_cgraph * cgraph, int node_idx, int num_fused, const char * fusion_string) {
+    static const std::vector<std::string> tokens = [] {
+        std::vector<std::string> t;
+        const char * v = getenv("LLAMA_MELLUM_ABLATE");
+        std::string s = v ? v : "";
+        size_t pos = 0;
+        while (pos <= s.size() && !s.empty()) {
+            const size_t end = s.find(',', pos);
+            const std::string tok = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!tok.empty()) {
+                t.push_back(tok);
+            }
+            if (end == std::string::npos) {
+                break;
+            }
+            pos = end + 1;
+        }
+        if (!t.empty()) {
+            GGML_LOG_WARN("ggml_vulkan: LLAMA_MELLUM_ABLATE=%s: timing ablation, output is garbage\n", s.c_str());
+        }
+        return t;
+    }();
+    if (tokens.empty()) {
+        return false;
+    }
+    const std::string label = fusion_string ? fusion_string : ggml_op_name(cgraph->nodes[node_idx]->op);
+    for (const auto & tok : tokens) {
+        if (tok == label) {
+            return true;
+        }
+        for (int k = 0; k <= num_fused; ++k) {
+            const std::string name = cgraph->nodes[node_idx + k]->name;
+            if (name.size() > tok.size() && name.compare(0, tok.size(), tok) == 0 && name[tok.size()] == '-') {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// One-token MoE down-projection group: MUL_MAT_ID (IQ4_NL / Q5_0 experts, [ncols x n_used] input), MUL by the router
+// weights, the n_used views of the product, and n_used ADDs that sum the views and one residual. Returns the index
+// of the last ADD (the group's only output) or -1; *residual receives the residual tensor. LLAMA_MELLUM_FUSE_MOE_DOWN=1.
+static int ggml_vk_moe_down_end(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx, const ggml_tensor ** residual) {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_MELLUM_FUSE_MOE_DOWN");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    const ggml_tensor * mm = cgraph->nodes[node_idx];
+    if (!enabled || mm->op != GGML_OP_MUL_MAT_ID || node_idx + 3 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * a   = mm->src[0];
+    const ggml_tensor * b   = mm->src[1];
+    const ggml_tensor * ids = mm->src[2];
+    if (a->type != GGML_TYPE_IQ4_NL && a->type != GGML_TYPE_Q5_0) {
+        return -1;
+    }
+    const int64_t ncols  = a->ne[0];
+    const int64_t nrows  = a->ne[1];
+    const int64_t n_used = ids->ne[0];
+    const size_t align = ctx->device->properties.limits.minStorageBufferOffsetAlignment;
+    auto aligned = [&](const ggml_tensor * t) { return (vk_tensor_offset(t) + t->view_offs) % align == 0; };
+    if (n_used < 2 || n_used > 8 || ncols % 32 != 0 || !ggml_is_contiguous(a) || a->ne[3] != 1 ||
+        b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) || b->ne[0] != ncols || b->ne[1] != n_used || b->ne[2] != 1 || b->ne[3] != 1 ||
+        ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || ids->ne[1] != 1 ||
+        mm->ne[0] != nrows || mm->ne[1] != n_used || mm->ne[2] != 1 || !aligned(a) || !aligned(b) || !aligned(ids) ||
+        ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return -1;
+    }
+    const ggml_tensor * mul = cgraph->nodes[node_idx + 1];
+    if (mul->op != GGML_OP_MUL || mul->src[0] != mm || ggml_node_get_use_count(cgraph, node_idx + 1) != n_used) {
+        return -1;
+    }
+    const ggml_tensor * wts = mul->src[1];
+    if (wts->type != GGML_TYPE_F32 || !ggml_is_contiguous(wts) || wts->ne[0] != 1 || ggml_nelements(wts) != n_used || !aligned(wts)) {
+        return -1;
+    }
+    // the views and the ADD chain, in any interleaving
+    std::vector<const ggml_tensor *> views;
+    uint32_t seen = 0;
+    const ggml_tensor * res = nullptr;
+    const ggml_tensor * prev_add = nullptr;
+    int n_adds = 0;
+    int j = node_idx + 2;
+    for (; j < cgraph->n_nodes && n_adds < n_used; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_VIEW) {
+            if (node->view_src != mul || node->view_offs % mul->nb[1] != 0 || node->view_offs / mul->nb[1] >= (size_t) n_used ||
+                ggml_nelements(node) != nrows || !ggml_is_contiguous(node) || ggml_node_get_use_count(cgraph, j) != 1) {
+                return -1;
+            }
+            const uint32_t slot = 1u << (node->view_offs / mul->nb[1]);
+            if (seen & slot) {
+                return -1;
+            }
+            seen |= slot;
+            views.push_back(node);
+            continue;
+        }
+        if (node->op != GGML_OP_ADD || node->type != GGML_TYPE_F32 || ggml_nelements(node) != nrows || !ggml_is_contiguous(node)) {
+            return -1;
+        }
+        bool chained = prev_add == nullptr;
+        for (int s = 0; s < 2; ++s) {
+            const ggml_tensor * src = node->src[s];
+            if (std::find(views.begin(), views.end(), src) != views.end()) {
+                continue;
+            }
+            if (src == prev_add) {
+                chained = true;
+                continue;
+            }
+            if (res != nullptr || src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) || ggml_nelements(src) != nrows || !aligned(src)) {
+                return -1;
+            }
+            res = src;
+        }
+        n_adds++;
+        if (!chained || (n_adds < n_used && ggml_node_get_use_count(cgraph, j) != 1)) {
+            return -1;
+        }
+        prev_add = node;
+    }
+    if (n_adds != n_used || seen != (1u << n_used) - 1 || res == nullptr || !aligned(prev_add)) {
+        return -1;
+    }
+    *residual = res;
+    return j - 1;
 }
 
 static bool ggml_vk_is_view_op(const ggml_tensor * t) {
@@ -15185,7 +15370,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the fused result in an elementwise-way. This affects whether the memory for
         // the src is allowed to overlap the memory for the destination.
         // The array is sized to handle the largest fusion (asserted later).
-        bool op_srcs_fused_elementwise[13];
+        bool op_srcs_fused_elementwise[32]; // the MoE down group has up to 18 nodes
 
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
@@ -15193,9 +15378,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_hc_post_gate = false;
         ctx->fused_norm_mul_mat_vec = false;
         ctx->fused_norm_deferred = false;
+        ctx->fused_moe_down = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
         const char *fusion_string {};
         int norm_mv_end = -1;
+        int moe_down_end = -1;
         // a MUL_MAT that applies a deferred norm reads x, not its src[1]: keep it unfused
         if (!ctx->device->disable_fusion && ggml_vk_find_deferred_norm(ctx, cgraph->nodes[i]) == nullptr) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -15214,6 +15401,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 fusion_string = "MUL_MAT_ADD";
                 op_srcs_fused_elementwise[0] = false;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (const ggml_tensor * moe_res = nullptr; (moe_down_end = ggml_vk_moe_down_end(ctx, cgraph, i, &moe_res)) > 0) {
+                ctx->num_additional_fused_ops = moe_down_end - i;
+                ctx->fused_moe_down = true;
+                fusion_string = "MOE_DOWN_SUM";
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                std::fill_n(op_srcs_fused_elementwise + 2, ctx->num_additional_fused_ops - 1, true);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_ADD_ID, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 2;
                 fusion_string = "MUL_MAT_ID_ADD_ID_MUL";
@@ -15453,9 +15647,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_norm_mul_mat_vec = false;
                 ctx->fused_norm_deferred = false;
+                ctx->fused_moe_down = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
                 fusion_string = nullptr;
             }
+        }
+
+        ctx->ablate_node = ggml_vk_ablate(cgraph, i, ctx->num_additional_fused_ops, fusion_string);
+        if (ctx->ablate_node) {
+            ctx->fused_ops_write_mask = 0; // later users see no pending write, as with a fused producer
         }
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)

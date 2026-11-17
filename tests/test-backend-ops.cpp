@@ -5978,6 +5978,60 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// One-token MoE down-projection, router weights, expert sum and residual, as llama's build_moe_ffn emits them
+struct test_moe_down_sum : public test_case {
+    const ggml_type type;
+    const int64_t n_ff;
+    const int64_t n_embd;
+    const int n_expert;
+    const int n_used;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_DOWN_SUM";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n_ff, n_embd, n_expert, n_used);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_moe_down_sum(ggml_type type = GGML_TYPE_IQ4_NL, int64_t n_ff = 896, int64_t n_embd = 2304, int n_expert = 64, int n_used = 8)
+        : type(type), n_ff(n_ff), n_embd(n_embd), n_expert(n_expert), n_used(n_used) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a   = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_expert);
+        ggml_tensor * h   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, 1);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, 1);
+        ggml_tensor * w   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, 1);
+        ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+        ggml_set_name(a, "a");
+        ggml_set_name(h, "h");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(w, "w");
+        ggml_set_name(res, "res");
+
+        ggml_tensor * experts = ggml_mul(ctx, ggml_mul_mat_id(ctx, a, h, ids), w);
+        ggml_tensor * moe = nullptr;
+        for (int i = 0; i < n_used; ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, 1, experts->nb[2], i*experts->nb[1]);
+            moe = moe ? ggml_add(ctx, moe, v) : v;
+        }
+        ggml_tensor * out = ggml_add(ctx, moe, res);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_expert);
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11610,6 +11664,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 64, 1e-6f, 3e5f));
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec(256, 7, 1e-5f, 1.0f));
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 64, 1e-6f, 10.0f, GGML_TYPE_F32, true));
+    for (ggml_type t : { GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0 }) {
+        test_cases.emplace_back(new test_moe_down_sum(t));
+        test_cases.emplace_back(new test_moe_down_sum(t, 256, 512, 16, 4));
+    }
     for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
         test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 4096, 1e-6f, 10.0f, t, true));
         test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 512, 1e-6f, 3e5f, t, true));

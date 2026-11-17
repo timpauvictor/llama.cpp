@@ -32,6 +32,7 @@ struct vk_mat_vec_push_constants {
     float norm_eps;         // NORM_FUSION mat-vec only
     uint32_t norm_partials; // NORM_FUSION mat-vec only
     uint32_t norm_write;    // NORM_FUSION mat-vec only: write the normalized row
+    uint32_t moe_n_used;    // MOE_SUM mat-vec only: number of used experts
 };
 
 struct vk_mat_vec_p021_push_constants {

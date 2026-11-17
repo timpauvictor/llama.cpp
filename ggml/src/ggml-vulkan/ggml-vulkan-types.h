@@ -826,6 +826,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
     vk_pipeline pipeline_mul_mat_vec_norm_f32_f32[DMMV_WG_SIZE_COUNT][3]; // 1, 2, 4 rows per workgroup
     vk_pipeline pipeline_mul_mat_vec_norm_q[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT]; // Q4_K, Q5_K, Q6_K
+    vk_pipeline pipeline_mul_mat_vec_moe[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];    // IQ4_NL, Q5_0
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1344,6 +1345,10 @@ struct ggml_backend_vk_context {
     // RMS_NORM + MUL whose only users are mat-vecs: nothing is dispatched; each mat-vec applies the norm
     // itself from the producer's RMS partials (mellum-rdna3 fork)
     bool fused_norm_deferred {};
+    // MUL_MAT_ID (one-token expert down) + MUL (router weights) + views + ADDs (expert sum, residual) as one mat-vec
+    bool fused_moe_down {};
+    // LLAMA_MELLUM_ABLATE timing ablation: this node group dispatches nothing (output is garbage)
+    bool ablate_node {};
     struct deferred_norm {
         const ggml_tensor * mul;
         const ggml_tensor * x;

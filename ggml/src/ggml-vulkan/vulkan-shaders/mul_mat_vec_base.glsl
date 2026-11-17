@@ -40,6 +40,7 @@ layout (push_constant) uniform parameter
     float norm_eps;     // NORM_FUSION only
     uint norm_partials; // NORM_FUSION only: number of RMS partials to read, 0 = compute the sum here
     uint norm_write;    // NORM_FUSION only: write the normalized row to binding 4
+    uint moe_n_used;    // MOE_SUM only: number of used experts
 #endif
 } p;
 

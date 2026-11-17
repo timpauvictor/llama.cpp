@@ -46,3 +46,9 @@ layout (binding = 5) readonly buffer NormPartials {float data_norm_partials[];};
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
 #endif
 
+#ifdef MOE_SUM
+// mellum-rdna3 fork: one-token MoE down-projection + router weights + expert sum. Binding 3 holds the residual.
+layout (binding = 5) readonly buffer MoeIds {int data_moe_ids[];};
+layout (binding = 6) readonly buffer MoeW {float data_moe_w[];};
+#endif
+

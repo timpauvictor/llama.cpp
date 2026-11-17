@@ -264,6 +264,83 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     reduce_result(temp, d_offset, first_row, num_rows, tid);
 }
 
+#ifdef MOE_SUM
+// The used experts form one long row: expert slot e owns columns [e*ncols, (e+1)*ncols) of B (the [ncols x n_used]
+// expert input) and of the virtual A row, whose blocks come from expert ids[e]. The router weight scales each
+// expert's part, so one reduction yields sum_e w_e * (A_e x_e); BIAS0 adds the residual. Quant types only
+// (K_PER_ITER 8), ncols % QUANT_K == 0, so a block never spans two experts.
+shared uint moe_a_off[8];
+shared FLOAT_TYPE moe_w[8];
+
+void iter_moe(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i) {
+    const uint gcol = i*BLOCK_SIZE + K_PER_ITER*tid;
+    if (gcol >= p.ncols * p.moe_n_used) {
+        return;
+    }
+    const uint e = gcol / p.ncols;
+    const uint col = gcol - e*p.ncols;
+    const uint iqs = (col%QUANT_K)/QUANT_R;
+    const uint iybs = gcol - col%QUANT_K;
+#if QUANT_R == 2
+    const vec4 bv02 = vec4(data_b_v4[(iybs + iqs) / 4]);
+    const vec4 bv13 = vec4(data_b_v4[(iybs + iqs + y_offset) / 4]);
+    const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+    const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+#else
+    const vec4 bv0 = vec4(data_b_v4[(iybs + iqs) / 4]);
+    const vec4 bv1 = vec4(data_b_v4[(iybs + iqs) / 4 + 1]);
+#endif
+    const uint aoff = moe_a_off[e];
+    const FLOAT_TYPE w = moe_w[e];
+    uint ibi = first_row*p.ncols;
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib = (ibi + col)/QUANT_K;
+        ibi += p.ncols;
+        vec4 v = dequantize4(ib, iqs, aoff);
+        vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), aoff);
+        const vec2 dm = get_dm(ib, aoff);
+        if (dm.y != 0) {
+            v = v * dm.x + dm.y;
+            v2 = v2 * dm.x + dm.y;
+        }
+        FLOAT_TYPE rowtmp = dot(bv0, v);
+        rowtmp += dot(bv1, v2);
+        if (dm.y == 0) {
+            rowtmp *= dm.x;
+        }
+        temp[0][n] += w * rowtmp;
+    }
+}
+
+void compute_outputs_moe(const uint32_t first_row, const uint32_t num_rows) {
+    const uint tid = gl_LocalInvocationID.x;
+    a_offset = 0;
+    b_offset = 0;
+    d_offset = 0;
+    y_offset = QUANT_R == 1 ? 1 : QUANT_K/2;
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            temp[j][n] = FLOAT_TYPE(0);
+        }
+    }
+    const uint num_iters = (p.ncols * p.moe_n_used + K_PER_ITER*BLOCK_SIZE - 1) / (K_PER_ITER*BLOCK_SIZE);
+    uint i = 0;
+    while (i + 4 <= num_iters) {
+        [[unroll]] for (uint k = 0; k < 4; ++k) {
+            iter_moe(temp, first_row, num_rows, tid, i*K_PER_ITER);
+            i++;
+        }
+    }
+    while (i < num_iters) {
+        iter_moe(temp, first_row, num_rows, tid, i*K_PER_ITER);
+        i++;
+    }
+    reduce_result(temp, d_offset, first_row, num_rows, tid);
+}
+#endif
+
 void main() {
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
@@ -273,6 +350,24 @@ void main() {
 
 #ifdef NORM_FUSION
     norm_prologue();
+#endif
+
+#ifdef MOE_SUM
+    {
+        const uint tid = gl_LocalInvocationID.x;
+        if (tid < p.moe_n_used) {
+            const int id = data_moe_ids[tid];
+            moe_a_off[tid] = id < 0 ? 0 : uint(id) * (p.batch_stride_a / QUANT_K);
+            moe_w[tid] = id < 0 ? FLOAT_TYPE(0) : FLOAT_TYPE(data_moe_w[tid]);
+        }
+        barrier();
+        if (first_row + NUM_ROWS <= p.stride_d) {
+            compute_outputs_moe(first_row, NUM_ROWS);
+        } else if (first_row < p.stride_d) {
+            compute_outputs_moe(first_row, min(NUM_ROWS, p.stride_d - first_row));
+        }
+        return;
+    }
 #endif
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
