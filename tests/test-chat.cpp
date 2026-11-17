@@ -2216,8 +2216,99 @@ static void test_lfm2_parser(const std::string & template_path, bool detailed_de
 
 }
 
+static void test_mellum_reasoning_tool_recovery(bool detailed_debug) {
+    const std::string path = "models/templates/JetBrains-Mellum2.1-12B-A2.5B-Thinking.jinja";
+    std::string path_lower = path;
+    std::string filter_lower = g_template_filter;
+    std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(), ::tolower);
+    std::transform(filter_lower.begin(), filter_lower.end(), filter_lower.begin(), ::tolower);
+    if (!filter_lower.empty() && path_lower.find(filter_lower) == std::string::npos) {
+        return;
+    }
+    auto tmpls = read_templates(path);
+    common_chat_templates_inputs inputs;
+    inputs.messages = {message_user};
+    inputs.add_generation_prompt = true;
+    inputs.enable_thinking = true;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    inputs.parallel_tool_calls = true;
+    inputs.tools = {
+        {"read", "Read a file", R"({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer"},"limit":{"type":"integer"}},"required":["path"]})"},
+        {"grep", "Search a file", R"({"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"context":{"type":"integer"},"limit":{"type":"integer"}},"required":["pattern","path"]})"},
+    };
+    common_chat_session_params session_params;
+    session_params.debug = detailed_debug;
+    const auto parse = [&](const std::string & text, bool partial = false) {
+        common_chat_session session(tmpls.get(), nullptr, inputs, session_params);
+        return common_chat_msg(partial ? session.feed(common_chat_input(text)) : session.finish(common_chat_input(text)));
+    };
+    const auto unchanged = [&](const std::string & name, const std::string & reasoning) {
+        LOG_INF("Mellum recovery: %s\n", name.c_str());
+        assert_msg_equals(simple_assist_msg("", reasoning), parse("<think>\n" + reasoning), true);
+    };
+
+    // Keep the exact server-returned reasoning, including both calls in the second sample.
+    const auto examples = json::parse(read_file("tests/mellum-tool-call-in-think.json"));
+    const std::vector<std::vector<common_chat_tool_call>> expected_calls = {
+        {{"read", R"({"path":"/workspace/toa-eval/repo/ARCHITECTURE.md","offset":220,"limit":80})", ""}},
+        {
+            {"grep", R"({"pattern":"AI|Diagnostics|diagnostics","path":"src/TimeOfAncients/App/UI/ImGui/ImGuiGameplayControls.cs","context":4,"limit":50})", ""},
+            {"grep", R"({"pattern":"Draw(GameTime","path":"src/TimeOfAncients/App/UI/ImGui/ImGuiGameplayControls.cs","context":6,"limit":15})", ""},
+        },
+        {{"read", R"({"path":"_scratch/social-dialogue-00.2/topic-batches.json"})", ""}},
+    };
+    assert_equals(expected_calls.size(), examples.size());
+    for (size_t i = 0; i < examples.size(); ++i) {
+        LOG_INF("Mellum recovery: real example %zu\n", i);
+        const auto reasoning = examples.at(i).at("reasoning_content_as_returned").get<std::string>();
+        auto expected = simple_assist_msg("", string_strip(reasoning.substr(0, reasoning.find("<tool_call>"))));
+        expected.tool_calls = expected_calls[i];
+        const auto recovered = parse("<think>\n" + reasoning);
+        assert_msg_equals(expected, recovered, true);
+        assert_equals<std::string>(expected.reasoning_content, recovered.reasoning_content);
+        assert_equals(std::string(), recovered.content);
+        assert_msg_equals(simple_assist_msg("", reasoning), parse("<think>\n" + reasoning, true), true);
+
+        common_chat_session session(tmpls.get(), nullptr, inputs, session_params);
+        session.feed(common_chat_input("<think>\n" + reasoning));
+        assert_msg_equals(expected, session.finish(), true);
+    }
+
+    const std::string call = "<tool_call>\n{\"name\":\"read\",\"arguments\":{\"path\":\"file.txt\"}}\n</tool_call>";
+    unchanged("trailing prose", "Think.\n" + call + "\nMore thinking.");
+    unchanged("unknown tool", "Think.\n<tool_call>\n{\"name\":\"unknown\",\"arguments\":{}}\n</tool_call>");
+    unchanged("invalid JSON", "Think.\n<tool_call>\n{\"name\":\"read\",\"arguments\":}\n</tool_call>");
+    unchanged("partial block", "Think.\n<tool_call>\n{\"name\":\"read\",\"arguments\":{}}");
+    unchanged("quoted block", "Think.\n\"" + call + "\"");
+    unchanged("fenced block", "Think.\n```json\n" + call + "\n```");
+    unchanged("unclosed fence", "Think.\n```json\n" + call);
+    unchanged("excessive JSON nesting", "Think.\n<tool_call>\n{\"name\":\"read\",\"arguments\":{\"path\":" +
+              std::string(COMMON_RECURSIVE_LIMIT + 1, '[') + "0" + std::string(COMMON_RECURSIVE_LIMIT + 1, ']') + "}}\n</tool_call>");
+    unchanged("invalid JSON parallel group", "Think.\n<tool_call>\n{\"name\":\"read\",\"arguments\":}\n</tool_call>\n" + call);
+    unchanged("invalid parallel group", "Think.\n<tool_call>\n{\"name\":\"unknown\",\"arguments\":{}}\n</tool_call>\n" + call);
+
+    auto expected = simple_assist_msg("", "Think.", "read", R"({"path":"file.txt"})");
+    LOG_INF("Mellum recovery: normal closed reasoning\n");
+    assert_msg_equals(expected, parse("<think>\nThink.\n</think>\n" + call), true);
+    expected.reasoning_content = "Think.\n" + call;
+    LOG_INF("Mellum recovery: content call already present\n");
+    assert_msg_equals(expected, parse("<think>\nThink.\n" + call + "\n</think>\n" + call), true);
+
+    LOG_INF("Mellum recovery: trailing whitespace\n");
+    expected.reasoning_content = "Think.";
+    const auto trimmed = parse("<think>\n  Think.\n" + call + "\n \t");
+    assert_msg_equals(expected, trimmed, true);
+    assert_equals(std::string("Think."), trimmed.reasoning_content);
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
+    unchanged("tool choice none", "Think.\n" + call);
+    inputs.tools.clear();
+    inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+    unchanged("no request tools", "Think.\n" + call);
+}
+
 static void test_template_output_peg_parsers(bool detailed_debug) {
     LOG_DBG("%s\n", __func__);
+    test_mellum_reasoning_tool_recovery(detailed_debug);
 
     // JSON schemas
     const char * invoice_schema = R"({

@@ -315,6 +315,7 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     common_peg_arena                    parser;
     common_chat_msg_delimiters          message_delimiters;
+    std::vector<std::string>            reasoning_tool_names; // Allowed tools for final reasoning recovery
 };
 
 struct common_chat_input {
@@ -349,10 +350,12 @@ struct common_chat_parser_params {
     common_chat_input  generation_prompt;
     bool               debug  = false; // Enable debug output for PEG parser
     common_peg_arena   parser = {};
+    std::vector<std::string> reasoning_tool_names;
     common_chat_parser_params() = default;
     common_chat_parser_params(const common_chat_params & chat_params) {
         format  = chat_params.format;
         generation_prompt = common_chat_input(chat_params.generation_prompt);
+        reasoning_tool_names = chat_params.reasoning_tool_names;
     }
 };
 

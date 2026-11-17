@@ -1621,6 +1621,19 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
                 auto_params.thinking_end_tags = {std::move(end_tag)};
             }
         }
+        const auto & tool_format = autoparser.tools.format;
+        const auto call_start = tool_format.per_call_start.empty() ? tool_format.section_start : tool_format.per_call_start;
+        const auto call_end = tool_format.per_call_end.empty() ? tool_format.section_end : tool_format.per_call_end;
+        if (auto_params.thinking_start_tag == "<think>" && auto_params.thinking_end_tags == std::vector<std::string>{"</think>"} &&
+            tool_format.mode == autoparser::tool_format::JSON_NATIVE && trim_whitespace(call_start) == "<tool_call>" &&
+            trim_whitespace(call_end) == "</tool_call>" && tool_format.name_field == "name" &&
+            tool_format.args_field == "arguments" && !tool_format.fun_name_is_key && !tool_format.tools_array_wrapped &&
+            (tool_format.function_field.empty() || tool_format.function_field == "function") &&
+            params.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+            for (const auto & tool : inputs.tools) {
+                auto_params.reasoning_tool_names.push_back(tool.name);
+            }
+        }
         const auto & arena = auto_params.parser;
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
         return auto_params;
@@ -1798,6 +1811,86 @@ common_chat_input common_chat_input_tokenize(const llama_vocab * vocab, const st
     return input;
 }
 
+static void common_chat_recover_reasoning_tools(common_chat_msg & msg, const std::vector<std::string> & tool_names) {
+    if (tool_names.empty() || !msg.tool_calls.empty() || !msg.content.empty()) {
+        return;
+    }
+
+    const std::string call_start = "<tool_call>";
+    const std::string call_end = "</tool_call>";
+    const auto & reasoning = msg.reasoning_content;
+    size_t end = reasoning.find_last_not_of(" \t\r\n");
+    std::vector<common_chat_tool_call> calls;
+    size_t first = std::string::npos;
+    while (end != std::string::npos && end + 1 >= call_end.size() &&
+           reasoning.compare(end + 1 - call_end.size(), call_end.size(), call_end) == 0) {
+        const size_t close = end + 1 - call_end.size();
+        size_t start = reasoning.rfind(call_start, close);
+        // Skip markers inside JSON strings and inline quotations.
+        while (start != std::string::npos) {
+            const size_t line = reasoning.rfind('\n', start);
+            const size_t line_start = line == std::string::npos ? 0 : line + 1;
+            if (reasoning.find_first_not_of(" \t", line_start) == start) {
+                break;
+            }
+            start = start == 0 ? std::string::npos : reasoning.rfind(call_start, start - 1);
+        }
+        if (start == std::string::npos) {
+            return;
+        }
+        const auto payload = reasoning.substr(start + call_start.size(), close - start - call_start.size());
+        // Bound nesting before JSON serialization can recurse through model output.
+        size_t depth = 0;
+        bool in_string = false;
+        bool escaped = false;
+        for (char c : payload) {
+            if (in_string) {
+                if (escaped) {
+                    escaped = false;
+                } else if (c == '\\') {
+                    escaped = true;
+                } else if (c == '"') {
+                    in_string = false;
+                }
+            } else if (c == '"') {
+                in_string = true;
+            } else if (c == '{' || c == '[') {
+                if (++depth > COMMON_RECURSIVE_LIMIT) {
+                    return;
+                }
+            } else if ((c == '}' || c == ']') && depth > 0) {
+                --depth;
+            }
+        }
+        auto call = json::parse_no_throw(payload);
+        if (!call.is_object() || !call.contains("name") || !call.at("name").is_string() || !call.contains("arguments")) {
+            return;
+        }
+        const auto name = call.at("name").get<std::string>();
+        if (std::find(tool_names.begin(), tool_names.end(), name) == tool_names.end()) {
+            return;
+        }
+        calls.push_back({name, call.at("arguments").dump(), ""});
+        first = start;
+        end = start == 0 ? std::string::npos : reasoning.find_last_not_of(" \t\r\n", start - 1);
+    }
+    if (calls.empty()) {
+        return;
+    }
+    for (const auto * fence : {"```", "~~~"}) {
+        size_t count = 0;
+        for (size_t pos = reasoning.find(fence); pos < first; pos = reasoning.find(fence, pos + 3)) {
+            ++count;
+        }
+        if (count % 2 != 0) {
+            return;
+        }
+    }
+    std::reverse(calls.begin(), calls.end());
+    msg.reasoning_content = trim_whitespace(reasoning.substr(0, first));
+    msg.tool_calls = std::move(calls);
+}
+
 common_chat_msg common_chat_parse(const common_chat_input &         input,
                                   bool                              is_partial,
                                   const common_chat_parser_params & params) {
@@ -1880,6 +1973,7 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     }
 
     if (!is_partial) {
+        common_chat_recover_reasoning_tools(msg, params.reasoning_tool_names);
         LOG_DBG("Parsed message: %s\n", common_chat_msgs_to_json_oaicompat({ msg }).at(0).dump().c_str());
     }
     return msg;
@@ -1907,6 +2001,7 @@ common_chat_session::common_chat_session(const common_chat_templates *        tm
                                             : common_chat_input(applied.generation_prompt);
     parser_params.debug             = params.debug;
     parser_params.parser            = std::move(applied.parser);
+    parser_params.reasoning_tool_names = std::move(applied.reasoning_tool_names);
 
     delimiters = std::move(applied.message_delimiters);
 
