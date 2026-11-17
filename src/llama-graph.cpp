@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include <cstdlib>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -1721,6 +1723,15 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+// mellum-rdna3 fork: opt-in, read once (see build_moe_ffn).
+static bool llama_mellum_decode_skip_amax() {
+    static const bool enabled = [] {
+        const char * v = getenv("LLAMA_MELLUM_DECODE_SKIP_AMAX");
+        return v != nullptr && atoi(v) != 0;
+    }();
+    return enabled;
+}
+
 llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
           ggml_tensor * cur) const {
     llm_graph_amax_src1 result = {
@@ -2587,7 +2598,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         //       ref: https://github.com/ggml-org/llama.cpp/pull/30656#issuecomment-6269597922
         llm_graph_amax_src1 amax_src1 = { nullptr, nullptr };
 
-        if (arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT || arch == LLM_ARCH_LAGUNA) {
+        // mellum-rdna3 fork: LLAMA_MELLUM_DECODE_SKIP_AMAX=1 skips the rescale chain for single-token batches.
+        // Measured 2026-11-16 (RX 7900 XT, Vulkan): the chain is ~32% of decode GPU time (11 tiny ops per layer).
+        // Safe only where a 1-token MUL_MAT_ID keeps src1 in F32 end to end: Vulkan mul_mat_vec_id_*_f32_f32
+        // (FLOAT_TYPE float) without Q8_1, i.e. ggml_vk_should_use_mmvq false for n == 1 (AMD/NVIDIA at k = 896;
+        // not with GGML_VK_FORCE_MMVQ). The chain scales by powers of two, so skipping it is bit-exact there.
+        // Batches of 2+ tokens (prefill, parallel slots) use Q8_1 and keep the chain.
+        if ((arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_MELLUM || arch == LLM_ARCH_FLINT || arch == LLM_ARCH_LAGUNA) &&
+                !(n_tokens == 1 && llama_mellum_decode_skip_amax())) {
             amax_src1 = build_amax_src1_f16(cur);
             cur = amax_src1.res;
         }
