@@ -34,9 +34,12 @@ layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 
 #ifdef NORM_FUSION
 // mellum-rdna3 fork: RMS_NORM + MUL fused into the mat-vec. Binding 3 holds the norm weight, binding 4 receives the
-// normalized input (written by workgroup 0) for other consumers such as the MoE projections.
+// normalized input (sliced across workgroups, when p.norm_write != 0) for other users such as the MoE projections.
 layout (binding = 3) readonly buffer Fuse0V4 {vec4 data_norm_w_v4[];};
+layout (binding = 3) readonly buffer Fuse0V2 {vec2 data_norm_w_v2[];};
 layout (binding = 4) writeonly buffer NormOutV4 {vec4 data_norm_out_v4[];};
+// RMS partial sums written by the producing ADD (used when p.norm_partials > 0)
+layout (binding = 5) readonly buffer NormPartials {float data_norm_partials[];};
 #endif
 
 #ifdef MUL_MAT_ID

@@ -77,14 +77,14 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const FLOAT_TYPE q4_15 = qs64_80_hi4.w;
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
-            vec2 by10 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2     ]);
-            vec2 by116 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 +  8]);
-            vec2 by132 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 + 16]);
-            vec2 by148 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 + 24]);
-            vec2 by20 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2     ]);
-            vec2 by216 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 +  8]);
-            vec2 by232 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 + 16]);
-            vec2 by248 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y2_idx) / 2 + 24]);
+            vec2 by10 =  LOAD_B_V2((j*p.batch_stride_b + b_offset + y1_idx) / 2     );
+            vec2 by116 = LOAD_B_V2((j*p.batch_stride_b + b_offset + y1_idx) / 2 +  8);
+            vec2 by132 = LOAD_B_V2((j*p.batch_stride_b + b_offset + y1_idx) / 2 + 16);
+            vec2 by148 = LOAD_B_V2((j*p.batch_stride_b + b_offset + y1_idx) / 2 + 24);
+            vec2 by20 =  LOAD_B_V2((j*p.batch_stride_b + b_offset + y2_idx) / 2     );
+            vec2 by216 = LOAD_B_V2((j*p.batch_stride_b + b_offset + y2_idx) / 2 +  8);
+            vec2 by232 = LOAD_B_V2((j*p.batch_stride_b + b_offset + y2_idx) / 2 + 16);
+            vec2 by248 = LOAD_B_V2((j*p.batch_stride_b + b_offset + y2_idx) / 2 + 24);
 
             const FLOAT_TYPE sx =
               fma(FLOAT_TYPE(by10.x), q4_0,
@@ -151,6 +151,9 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 }
 
 void main() {
+#ifdef NORM_FUSION
+    norm_prologue();
+#endif
     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows

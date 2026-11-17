@@ -37,7 +37,9 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
-    float norm_eps; // mellum-rdna3 fork: NORM_FUSION only (zero otherwise)
+    float norm_eps;     // NORM_FUSION only
+    uint norm_partials; // NORM_FUSION only: number of RMS partials to read, 0 = compute the sum here
+    uint norm_write;    // NORM_FUSION only: write the normalized row to binding 4
 #endif
 } p;
 
@@ -93,6 +95,78 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
+
+#ifdef NORM_FUSION
+// B is the raw RMS_NORM input: one contiguous row, ncols % 4 == 0. B loads apply (x * s) * w.
+#if !USE_SUBGROUP_ADD_NO_SHMEM
+shared float norm_sh[BLOCK_SIZE];
+#endif
+float norm_s;
+
+float norm_workgroup_sum(float sum) {
+#if USE_SUBGROUP_ADD_NO_SHMEM
+    return subgroupAdd(sum);
+#elif USE_SUBGROUP_ADD
+    sum = subgroupAdd(sum);
+    if (gl_SubgroupInvocationID == 0) {
+        norm_sh[gl_SubgroupID] = sum;
+    }
+    barrier();
+    sum = 0.0;
+    for (uint s = 0; s < gl_NumSubgroups; ++s) {
+        sum += norm_sh[s];
+    }
+    return sum;
+#else
+    const uint tid = gl_LocalInvocationID.x;
+    norm_sh[tid] = sum;
+    barrier();
+    for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            norm_sh[tid] += norm_sh[tid + s];
+        }
+        barrier();
+    }
+    return norm_sh[0];
+#endif
+}
+
+void norm_prologue() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint ncols4 = p.ncols / 4;
+    float sum = 0.0;
+    if (p.norm_partials > 0) {
+        for (uint i = tid; i < p.norm_partials; i += BLOCK_SIZE) {
+            sum += data_norm_partials[i];
+        }
+    } else {
+        for (uint c = tid; c < ncols4; c += BLOCK_SIZE) {
+            const vec4 x = vec4(data_b_v4[c]);
+            sum += dot(x, x);
+        }
+    }
+    sum = norm_workgroup_sum(sum);
+    norm_s = inversesqrt(sum / float(p.ncols) + p.norm_eps);
+
+    if (p.norm_write == 0) {
+        return;
+    }
+    // each workgroup writes one slice of the normalized row
+    const uint n_wg = gl_NumWorkGroups.x * gl_NumWorkGroups.z;
+    const uint wg = gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+    const uint per_wg = (ncols4 + n_wg - 1) / n_wg;
+    const uint c_end = min(ncols4, (wg + 1) * per_wg);
+    for (uint c = wg * per_wg + tid; c < c_end; c += BLOCK_SIZE) {
+        data_norm_out_v4[c] = (norm_s * vec4(data_b_v4[c])) * data_norm_w_v4[c];
+    }
+}
+
+#define LOAD_B_V4(idx) ((norm_s * vec4(data_b_v4[idx])) * data_norm_w_v4[idx])
+#define LOAD_B_V2(idx) ((norm_s * vec2(data_b_v2[idx])) * data_norm_w_v2[idx])
+#else
+#define LOAD_B_V4(idx) vec4(data_b_v4[idx])
+#define LOAD_B_V2(idx) vec2(data_b_v2[idx])
+#endif
 
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {

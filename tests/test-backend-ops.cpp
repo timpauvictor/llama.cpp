@@ -4166,6 +4166,8 @@ struct test_rms_norm_mul_mat_vec : public test_case {
     const int64_t m;
     const float eps;
     const float range;
+    const ggml_type type;  // weight type
+    const bool with_add;   // the norm input is an ADD result (lets backends use precomputed RMS partials)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4175,25 +4177,47 @@ struct test_rms_norm_mul_mat_vec : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR4(n, m, eps, range);
+        return VARS_TO_STR6(n, m, eps, range, type, with_add);
     }
 
-    test_rms_norm_mul_mat_vec(int64_t n = 2304, int64_t m = 64, float eps = 1e-6f, float range = 10.0f)
-        : n(n), m(m), eps(eps), range(range) {}
+    double max_nmse_err() override {
+        return type == GGML_TYPE_F32 ? 1e-7 : 5e-4;
+    }
+
+    test_rms_norm_mul_mat_vec(int64_t n = 2304, int64_t m = 64, float eps = 1e-6f, float range = 10.0f,
+            ggml_type type = GGML_TYPE_F32, bool with_add = false)
+        : n(n), m(m), eps(eps), range(range), type(type), with_add(with_add) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
         ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, m);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, n, m);
         ggml_set_name(x, "x");
         ggml_set_name(w, "w");
         ggml_set_name(a, "a");
+        if (with_add) {
+            ggml_tensor * x2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+            ggml_set_name(x2, "x2");
+            x = ggml_add(ctx, x, x2);
+        }
 
         ggml_tensor * mul = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
         ggml_tensor * mv  = ggml_mul_mat(ctx, a, mul);
-        ggml_tensor * out = ggml_concat(ctx, mv, mul, 0);
+        if (type == GGML_TYPE_F32) {
+            ggml_tensor * out = ggml_concat(ctx, mv, mul, 0);
+            ggml_set_name(out, "out");
+            return out;
+        }
+        // q/k/v shape: three projections read only the normalized row, with an unrelated op in between
+        ggml_tensor * ak = ggml_new_tensor_2d(ctx, type, n, m / 8);
+        ggml_tensor * av = ggml_new_tensor_2d(ctx, type, n, m / 8);
+        ggml_set_name(ak, "ak");
+        ggml_set_name(av, "av");
+        ggml_tensor * q = ggml_scale(ctx, mv, 0.5f);
+        ggml_tensor * k = ggml_mul_mat(ctx, ak, mul);
+        ggml_tensor * v = ggml_mul_mat(ctx, av, ggml_reshape_2d(ctx, mul, n, 1));
+        ggml_tensor * out = ggml_concat(ctx, ggml_concat(ctx, q, k, 0), v, 0);
         ggml_set_name(out, "out");
-
         return out;
     }
 
@@ -11585,6 +11609,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 64, 1e-6f, 10.0f));
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 64, 1e-6f, 3e5f));
     test_cases.emplace_back(new test_rms_norm_mul_mat_vec(256, 7, 1e-5f, 1.0f));
+    test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 64, 1e-6f, 10.0f, GGML_TYPE_F32, true));
+    for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 4096, 1e-6f, 10.0f, t, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mat_vec(2304, 512, 1e-6f, 3e5f, t, true));
+    }
 
     for (uint32_t n : {1, 127, 129, 511, 513, 2816, 4096, 16385}) {
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n, 3, 2, 1}));

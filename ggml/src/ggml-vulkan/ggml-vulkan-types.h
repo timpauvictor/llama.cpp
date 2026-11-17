@@ -825,6 +825,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dequant_mul_mat_vec_f16_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
     vk_pipeline pipeline_mul_mat_vec_norm_f32_f32[DMMV_WG_SIZE_COUNT][3]; // 1, 2, 4 rows per workgroup
+    vk_pipeline pipeline_mul_mat_vec_norm_q[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT]; // Q4_K, Q5_K, Q6_K
 
     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
@@ -1340,6 +1341,18 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     bool fused_norm_mul_mat_vec {};
+    // RMS_NORM + MUL whose only users are mat-vecs: nothing is dispatched; each mat-vec applies the norm
+    // itself from the producer's RMS partials (mellum-rdna3 fork)
+    bool fused_norm_deferred {};
+    struct deferred_norm {
+        const ggml_tensor * mul;
+        const ggml_tensor * x;
+        const ggml_tensor * w;
+        float eps;
+        size_t partials_offset;
+        uint32_t num_partials;
+    };
+    std::vector<deferred_norm> deferred_norms;
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
 
     // for GGML_VK_PERF_LOGGER

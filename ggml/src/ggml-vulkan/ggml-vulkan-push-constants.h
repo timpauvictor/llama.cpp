@@ -29,7 +29,9 @@ struct vk_mat_vec_push_constants {
     uint32_t ne12;
     uint32_t broadcast2;
     uint32_t broadcast3;
-    float norm_eps; // NORM_FUSION mat-vec only
+    float norm_eps;         // NORM_FUSION mat-vec only
+    uint32_t norm_partials; // NORM_FUSION mat-vec only
+    uint32_t norm_write;    // NORM_FUSION mat-vec only: write the normalized row
 };
 
 struct vk_mat_vec_p021_push_constants {
